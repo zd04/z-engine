@@ -12,8 +12,13 @@ declare(strict_types=1);
 
 namespace ZEngine\Reflection;
 
+use Closure;
 use FFI\CData;
 use ReflectionClass as NativeReflectionClass;
+use ZEngine\ClassExtension\ObjectCastInterface;
+use ZEngine\ClassExtension\ObjectCompareZvalInterface;
+use ZEngine\ClassExtension\ObjectCreateInterface;
+use ZEngine\ClassExtension\ObjectDoOperationInterface;
 use ZEngine\Core;
 use ZEngine\Type\ClosureEntry;
 use ZEngine\Type\HashTable;
@@ -44,6 +49,11 @@ class ReflectionClass extends NativeReflectionClass
 
     private CData $pointer;
 
+    /**
+     * Stores all allocated zend_object_handler pointers per class
+     */
+    public static array $objectHandlers = [];
+
     public function __construct($classNameOrObject)
     {
         try {
@@ -72,7 +82,7 @@ class ReflectionClass extends NativeReflectionClass
     public static function fromCData(CData $classEntry): ReflectionClass
     {
         /** @var ReflectionClass $reflectionClass */
-        $reflectionClass = (new ReflectionClass(static::class))->newInstanceWithoutConstructor();
+        $reflectionClass = (new NativeReflectionClass(static::class))->newInstanceWithoutConstructor();
         $classNameValue  = StringEntry::fromCData($classEntry->name);
         try {
             call_user_func([$reflectionClass, 'parent::__construct'], $classNameValue->getStringValue());
@@ -591,11 +601,125 @@ class ReflectionClass extends NativeReflectionClass
         return ReflectionClassConstant::fromCData($constantPtr, $name);
     }
 
+    /**
+     * Installs user-defined object handlers for given class to control extra-features of this class
+     */
+    public function installExtensionHandlers(): void
+    {
+        if ($this->implementsInterface(ObjectCreateInterface::class)) {
+            $handler = parent::getMethod('__init')->getClosure();
+            $this->setCreateObjectHandler($handler);
+        }
+
+        if ($this->implementsInterface(ObjectCastInterface::class)) {
+            $handler = parent::getMethod('__cast')->getClosure();
+            $this->setCastObjectHandler($handler);
+        }
+
+        if ($this->implementsInterface(ObjectDoOperationInterface::class)) {
+            $handler = parent::getMethod('__doOperation')->getClosure();
+            $this->setDoOperationHandler($handler);
+        }
+
+        if ($this->implementsInterface(ObjectCompareZvalInterface::class)) {
+            $handler = parent::getMethod('__compare')->getClosure();
+            $this->setCompareZvalHandler($handler);
+        }
+    }
+
     public function __debugInfo()
     {
         return [
             'name' => $this->getName(),
         ];
+    }
+
+    /**
+     * Installs the cast_object handler for current class
+     *
+     * @param Closure $handler Callback function (object $instance, int $typeTo);
+     *
+     * @see ObjectCastInterface
+     */
+    public function setCastObjectHandler(Closure $handler): void
+    {
+        $handlers = self::getObjectHandlers($this->pointer);
+
+        $handlers->cast_object = function (CData $objectZval, CData $returnZval, int $castType) use ($handler) {
+            ReflectionValue::fromValueEntry($objectZval)->getNativeValue($objectInstance);
+            $result = $handler($objectInstance, $castType);
+            ReflectionValue::fromValueEntry($returnZval)->setNativeValue($result);
+
+            return Core::SUCCESS;
+        };
+    }
+
+    /**
+     * Installs the compare handler for current class
+     *
+     * @param Closure $handler Callback function ($left, $right): int;
+     *
+     * @see ObjectCompareZvalInterface
+     */
+    public function setCompareZvalHandler(Closure $handler): void
+    {
+        $handlers = self::getObjectHandlers($this->pointer);
+
+        $handlers->compare = function (CData $returnZval, CData $leftZval, CData $rightZval) use ($handler) {
+            ReflectionValue::fromValueEntry($leftZval)->getNativeValue($leftValue);
+            ReflectionValue::fromValueEntry($rightZval)->getNativeValue($rightValue);
+            $result = $handler($leftValue, $rightValue);
+            ReflectionValue::fromValueEntry($returnZval)->setNativeValue($result);
+
+            return Core::SUCCESS;
+        };
+    }
+
+    /**
+     * Installs the do_operation handler for current class
+     *
+     * @param Closure $handler Callback function (object $instance, int $typeTo);
+     *
+     * @see ObjectDoOperationInterface
+     */
+    public function setDoOperationHandler(Closure $handler): void
+    {
+        $handlers = self::getObjectHandlers($this->pointer);
+
+        $handlers->do_operation = function (int $opcode, $resultZval, $leftZval, $rightZval) use ($handler) {
+            ReflectionValue::fromValueEntry($leftZval)->getNativeValue($leftValue);
+            ReflectionValue::fromValueEntry($rightZval)->getNativeValue($rightValue);
+            $result = $handler($opcode, $leftValue, $rightValue);
+
+            ReflectionValue::fromValueEntry($resultZval)->setNativeValue($result);
+
+            return Core::SUCCESS;
+        };
+    }
+
+    /**
+     * Installs the create_object handler, this handler is required for all other handlers
+     *
+     * @param Closure $handler Callback function (CData $classType, Closure $initializer): CData
+     *
+     * @see ObjectCreateInterface
+     */
+    public function setCreateObjectHandler(Closure $handler): void
+    {
+        $originalHandler = $this->pointer->create_object;
+        $initializer     = static function (CData $classType) use ($originalHandler) {
+            if ($originalHandler === null) {
+                $object = self::newInstanceRaw($classType);
+            } else {
+                $object = $originalHandler($classType);
+            }
+
+            return $object;
+        };
+
+        $this->pointer->create_object = static function (CData $classType) use ($handler, $initializer) {
+            return $handler($classType, $initializer);
+        };
     }
 
     /**
@@ -636,5 +760,71 @@ class ReflectionClass extends NativeReflectionClass
         $refMethod = ReflectionMethod::fromCData($rawFunction);
 
         return $refMethod;
+    }
+
+    /**
+     * Creates a new instance of zend_object.
+     *
+     * This method is useful within create_object handler
+     *
+     * @param CData $classType zend_class_entry type to create
+     *
+     * @return CData Instance of zend_object *
+     * @see zend_objects.c:zend_objects_new
+     */
+    private static function newInstanceRaw(CData $classType): CData
+    {
+        $objectSize = Core::sizeof(Core::type('zend_object'));
+        $totalSize  = $objectSize + self::getObjectPropertiesSize($classType);
+        $memory     = Core::new("char[{$totalSize}]", false);
+        $object     = Core::cast('zend_object *', $memory);
+
+        Core::call('zend_object_std_init', $object, $classType);
+        $object->handlers = self::getObjectHandlers($classType);
+        Core::call('object_properties_init', $object, $classType);
+
+        return $object;
+    }
+
+    /**
+     * Returns the size of memory required for storing properties for a given class type
+     *
+     * @param CData $classType zend_class_entry type to get object property size
+     *
+     * @see zend_objects_API.h:zend_object_properties_size
+     */
+    private static function getObjectPropertiesSize(CData $classType): int
+    {
+        $zvalSize  = Core::sizeof(Core::type('zval'));
+        $useGuards = (bool) ($classType->ce_flags & Core::ZEND_ACC_USE_GUARDS);
+
+        $totalSize = $zvalSize * ($classType->default_properties_count - ($useGuards ? 0 : 1));
+
+        return $totalSize;
+    }
+
+    /**
+     * Returns a pointer to the zend_object_handlers for given zend_class_entry
+     *
+     * We always create our own object handlers structure to have an ability to adjust callbacks in runtime,
+     * otherwise it is impossible because object handlers field is declared as "const"
+     *
+     * @param CData $classType zend_class_entry type to get object handlers
+     */
+    private static function getObjectHandlers(CData $classType): CData
+    {
+        $className = (StringEntry::fromCData($classType->name)->getStringValue());
+        if (!isset(self::$objectHandlers[$className])) {
+            $handlers    = Core::new('zend_object_handlers', false);
+            $stdHandlers = Core::getStandardObjectHandlers();
+            Core::memcpy($handlers, $stdHandlers, Core::sizeof($stdHandlers));
+
+            $pointer = Core::addr($handlers);
+            self::$objectHandlers[$className] = $pointer;
+        } else {
+            $pointer = self::$objectHandlers[$className];
+        }
+
+        return $pointer;
     }
 }
